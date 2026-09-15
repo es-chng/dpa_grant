@@ -1,0 +1,148 @@
+# ============================================================
+# One-sided, calibrated power simulation
+# Crossed random-effects GLMM + Likelihood Ratio Test
+# Primary question: Is agreement rate lower than the CAP 95% benchmark?
+# ============================================================
+
+suppressMessages(library(lme4))
+set.seed(2024)
+
+# ------------------------------------------------------------
+# 1. Data-generating process
+# ------------------------------------------------------------
+simulate_agreement_data <- function(n_pathologists,
+                                    true_agreement_rate,
+                                    n_cases = 60,
+                                    sigma_pathologist = 0.35,
+                                    sigma_case = 0.25) {
+  
+  path_eff <- rnorm(n_pathologists, 0, sigma_pathologist)
+  case_eff <- rnorm(n_cases, 0, sigma_case)
+  
+  logit_base <- qlogis(true_agreement_rate)
+  
+  grid <- expand.grid(
+    pathologist = seq_len(n_pathologists),
+    case        = seq_len(n_cases)
+  )
+  
+  eta <- logit_base + path_eff[grid$pathologist] + case_eff[grid$case]
+  grid$agree <- rbinom(nrow(grid), 1, plogis(eta))
+  
+  grid$pathologist <- factor(grid$pathologist)
+  grid$case        <- factor(grid$case)
+  grid
+}
+
+# ------------------------------------------------------------
+# 2. One-sided Likelihood Ratio Test vs 95% benchmark
+# ------------------------------------------------------------
+test_lrt_vs_benchmark <- function(df, benchmark = 0.95) {
+  
+  logit_benchmark <- qlogis(benchmark)
+  df$off <- logit_benchmark
+  
+  # Full model (free intercept)
+  full <- tryCatch(
+    glmer(agree ~ 1 + (1|pathologist) + (1|case),
+          data = df, family = binomial,
+          control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)),
+    error = function(e) NULL
+  )
+  
+  # Null model (intercept fixed at logit(0.95))
+  null <- tryCatch(
+    glmer(agree ~ 0 + offset(off) + (1|pathologist) + (1|case),
+          data = df, family = binomial,
+          control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)),
+    error = function(e) NULL
+  )
+  
+  if (is.null(full) || is.null(null)) return(NA_real_)
+  
+  # Likelihood ratio statistic
+  lr_stat <- as.numeric(2 * (logLik(full) - logLik(null)))
+  if (is.na(lr_stat) || lr_stat < 0) lr_stat <- 0
+  
+  # Two-sided p-value
+  p_two <- pchisq(lr_stat, df = 1, lower.tail = FALSE)
+  
+  # Convert to one-sided (lower tail only)
+  beta_hat <- fixef(full)[1]
+  if (beta_hat < logit_benchmark) {
+    p_one <- p_two / 2
+  } else {
+    p_one <- 1 - (p_two / 2)   # essentially non-significant for our purpose
+  }
+  
+  p_one
+}
+
+# ------------------------------------------------------------
+# 3. Monte-Carlo rate estimation
+# ------------------------------------------------------------
+run_sims <- function(n_pathologists,
+                     true_rate,
+                     n_sims = 400,
+                     benchmark = 0.95,
+                     alpha = 0.05) {
+  
+  rejections <- 0L
+  valid      <- 0L
+  
+  for (i in seq_len(n_sims)) {
+    df <- simulate_agreement_data(n_pathologists, true_rate)
+    p  <- test_lrt_vs_benchmark(df, benchmark)
+    
+    if (!is.na(p)) {
+      valid <- valid + 1L
+      if (p < alpha) rejections <- rejections + 1L
+    }
+  }
+  
+  if (valid == 0) return(NA_real_)
+  rejections / valid
+}
+
+# ------------------------------------------------------------
+# 4. Calibration check (Type I error under the null)
+# ------------------------------------------------------------
+cat("=== Calibration check (true agreement = 95%) ===\n")
+cat("A correctly calibrated one-sided test should reject ≈ 5% of the time.\n\n")
+cat(sprintf("%-30s %8s %12s\n", "Scenario", "n_path", "Type I error"))
+cat(strrep("-", 55), "\n")
+
+for (n in c(9, 12)) {
+  type1 <- run_sims(
+    n_pathologists = n,
+    true_rate      = 0.95,   # pure null
+    n_sims         = 500
+  )
+  cat(sprintf("%-30s %8d %11.1f%%\n", "Null (95% vs 95%)", n, 100 * type1))
+}
+
+# ------------------------------------------------------------
+# 5. Power under alternatives
+# ------------------------------------------------------------
+cat("\n=== Power under alternatives ===\n\n")
+cat(sprintf("%-30s %8s %10s\n", "True agreement rate", "n_path", "Power"))
+cat(strrep("-", 55), "\n")
+
+scenarios <- c(
+  "90% (modest erosion)"      = 0.90,
+  "85% (substantial erosion)" = 0.85
+)
+
+for (label in names(scenarios)) {
+  true_rate <- scenarios[[label]]
+  for (n in c(9, 12)) {
+    pwr <- run_sims(
+      n_pathologists = n,
+      true_rate      = true_rate,
+      n_sims         = 400
+    )
+    cat(sprintf("%-30s %8d %9.1f%%\n", label, n, 100 * pwr))
+  }
+}
+
+cat("\nDone.\n")
